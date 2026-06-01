@@ -1,0 +1,313 @@
+// ==========================================
+// LIBRARIES & DEPENDENCIES
+// ==========================================
+#include <Arduino.h>
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <RadioLib.h>
+#include <SPI.h>
+#include <Adafruit_MMA8451.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+
+// ==========================================
+// PIN CONFIGURATIONS & HARDWARE SETUP
+// ==========================================
+// Servo Pin
+const int SERVO_PIN = 5;
+
+// Motor Driver Pins (L298N / H-Bridge)
+const int MOTOR_ENB = 4;  // Speed control (PWM)
+const int MOTOR_IN3 = 2;  // Direction control
+const int MOTOR_IN4 = 3;  // Direction control
+
+// PWM Properties for Motor (ESP32 LEDC)
+const int PWM_FREQ = 1000;
+const int PWM_RES  = 8;
+
+// Hall Effect Sensor Pins
+const int HALL_SENSOR_PIN = 2;
+
+// Potentiometer Pins
+// Use GPIO 0 for the C3 Super Mini (ADC1_CH0)
+const int potPin = 0;
+
+// LoRa Pin Configuration
+#define LORA_CS    7
+#define LORA_RST   2
+#define LORA_DIO0  3
+
+#define LED_PIN          8
+#define LORA_BUTTON      9  // Renamed to avoid duplication
+#define ESP_NOW_BUTTON   3  // Renamed to avoid duplication
+
+// ESP-NOW Target Network Addresses
+uint8_t masterAddress[] = {0xAC, 0xA7, 0x04, 0xB8, 0xF5, 0x98};
+uint8_t slaveAddress[]  = {0x58, 0x8C, 0x81, 0xA3, 0x3C, 0x2C};
+
+// Create Global Hardware Objects & Variables
+unsigned long ledTimer = 0;
+
+
+
+// Create Hardware Objects
+Servo myServo;
+Adafruit_MMA8451 mma = Adafruit_MMA8451();
+SX1276 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST);
+int clickCount = 1;
+
+// Send Status Callback (from communication_slave.ino)
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("Send Status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+
+// Unified Receive Callback (handles incoming messages for both profiles)
+void OnDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           info->src_addr[0], info->src_addr[1], info->src_addr[2], 
+           info->src_addr[3], info->src_addr[4], info->src_addr[5]);
+
+  char buf[len + 1];
+  memcpy(buf, data, len);
+  buf[len] = '\0';
+  String msg = String(buf);
+  msg.trim();
+  
+  Serial.print("GOT DATA from ");
+  Serial.print(macStr);
+  Serial.print(": ");
+  Serial.println(msg);
+
+  if (msg == "timer") {
+    digitalWrite(LED_PIN, LOW); // LED ON
+    ledTimer = millis() + 2000;
+  }
+}
+
+// ==========================================
+// MAIN SETUP
+// ==========================================
+void setup() {
+  // Start Serial Monitor
+  Serial.begin(115200);
+  // Wait for serial port to connect / initialize (needed for USB-native boards)
+  while (!Serial) {
+    delay(10);
+  }
+  
+  delay(1000);
+
+  // Initialize Servo
+  myServo.attach(SERVO_PIN);
+
+  // Initialize Motor Driver Pins
+  pinMode(MOTOR_IN3, OUTPUT);
+  pinMode(MOTOR_IN4, OUTPUT);
+  ledcAttach(MOTOR_ENB, PWM_FREQ, PWM_RES);
+
+  // --- Hall Effect Sensor Initialization ---
+  pinMode(HALL_SENSOR_PIN, INPUT);
+  Serial.println("ESP32 Super Mini - Hall Effect Sensor Initialized.");
+
+  // --- Potentiometer Initialization ---
+  Serial.println("--- Potentiometer Live Monitor ---");
+  analogReadResolution(12);
+
+  // --- LoRa Initialization ---
+  delay(1000); 
+  pinMode(LORA_BUTTON, INPUT_PULLUP);
+  SPI.begin(4, 5, 6, 7); 
+
+  Serial.println(F("[GROUND STATION] Initializing LoRa..."));
+  int state = radio.begin(433.0, 125.0, 12, 8);
+
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.println(F("✅ GROUND STATION ONLINE!"));
+    radio.setOutputPower(20);
+    radio.startReceive();
+  } else {
+    Serial.print(F("❌ Init failed, code: ")); Serial.println(state);
+    while (true);
+  }
+
+  // Hardware Pin Configuration
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(ESP_NOW_BUTTON, INPUT_PULLUP);
+  digitalWrite(LED_PIN, HIGH); // LED OFF
+
+  // Wi-Fi / ESP-NOW Hardware Layer Setup
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE); // Force radio channel 1
+  WiFi.setSleep(false);                           // Prevent radio power-saving
+
+  if (esp_now_init() != ESP_OK) return;
+
+  // Register Callback Subscriptions
+  esp_now_register_send_cb(esp_now_send_cb_t(OnDataSent));
+  esp_now_register_recv_cb(esp_now_recv_cb_t(OnDataRecv));
+
+  // Register Slave Peer
+  esp_now_peer_info_t slavePeer = {};
+  memcpy(slavePeer.peer_addr, slaveAddress, 6);
+  slavePeer.channel = 1;
+  slavePeer.encrypt = false;
+  if (esp_now_add_peer(&slavePeer) != ESP_OK) {
+    Serial.println("Failed to add Slave peer");
+  }
+
+  // Register Master Peer
+  esp_now_peer_info_t masterPeer = {};
+  memcpy(masterPeer.peer_addr, masterAddress, 6);
+  masterPeer.channel = 1;
+  masterPeer.encrypt = false;
+  esp_now_add_peer(&masterPeer);
+  
+  Serial.println("Master/Slave Unified System Online...");
+}
+
+// ==========================================
+// MAIN LOOP
+// ==========================================
+void loop() {
+  moveServo();         // Run the servo routine
+  runMotor();          // Run the DC motor routine
+  readHallSensor();
+  readPotentiometer();
+  runLoraGroundStation();
+  runEspNowMaster();
+}
+
+// ==========================================
+// MODULAR FUNCTIONS
+// ==========================================
+
+/**
+ * Sweeps the servo motor between 0 and 90 degrees.
+ */
+void moveServo() {
+  myServo.write(0);
+  delay(1000);
+
+  myServo.write(90);
+  delay(1000);
+}
+
+/**
+ * Spins the DC motor forward at partial speed, then stops it.
+ */
+void runMotor() {
+  digitalWrite(MOTOR_IN3, HIGH);
+  digitalWrite(MOTOR_IN4, LOW);
+
+  ledcWrite(MOTOR_ENB, 150);
+  delay(2000);
+
+  ledcWrite(MOTOR_ENB, 0);
+  delay(1000);
+}
+
+/**
+ * Reads and processes data from the Hall Effect Sensor.
+ */
+void readHallSensor() {
+  int sensorValue = analogRead(HALL_SENSOR_PIN);
+  float voltage = sensorValue * (3.3 / 4095.0);
+
+  Serial.print("Raw ADC Value: ");
+  Serial.print(sensorValue);
+  Serial.print(" | Voltage: ");
+  Serial.print(voltage);
+  Serial.println(" V");
+
+  delay(200);
+}
+
+/**
+ * Reads and displays data from the Potentiometer.
+ */
+void readPotentiometer() {
+  int rawValue = analogRead(potPin);
+  float voltage = rawValue * (3.3 / 4095.0);
+  int percentage = map(rawValue, 0, 4095, 0, 100);
+
+  Serial.print("Raw: ");
+  Serial.print(rawValue);
+  Serial.print(" | Voltage: ");
+  Serial.print(voltage);
+  Serial.print("V | Position: ");
+  Serial.print(percentage);
+  Serial.println("%");
+
+  delay(100); 
+}
+
+/**
+ * Handles the LoRa background receiving and button-press transmissions.
+ */
+void runLoraGroundStation() {
+  if (digitalRead(LORA_BUTTON) == LOW) {
+    delay(50);
+    if (digitalRead(LORA_BUTTON) == LOW) {
+      String msg = "PING_CLICK_" + String(clickCount++);
+      Serial.println(F("\n================================================"));
+      Serial.print(F("🚀 Sending: "));
+      Serial.println(msg);
+      
+      int txState = radio.transmit(msg);
+      if (txState == RADIOLIB_ERR_NONE) {
+        Serial.println(F("Sent! Waiting for reply..."));
+        String response;
+        int rxState = radio.receive(response); 
+        
+        if (rxState == RADIOLIB_ERR_NONE) {
+          Serial.println(F("📥 REPLY RECEIVED FROM HIGH STATION!"));
+          Serial.print(F("Payload: ")); Serial.println(response);
+          Serial.print(F("RSSI:    ")); Serial.print(radio.getRSSI()); Serial.println(F(" dBm"));
+        } else {
+          Serial.println(F("❌ TIMEOUT: No response back from High Station."));
+        }
+      }
+      Serial.println(F("================================================"));
+      
+      radio.startReceive();
+      while(digitalRead(LORA_BUTTON) == LOW);
+    }
+  }
+
+  String backgroundMsg;
+  int bgRxState = radio.readData(backgroundMsg); 
+  
+  if (bgRxState == RADIOLIB_ERR_NONE) {
+    Serial.println(F("\n📢 SPONTANEOUS INCOMING ALERT FROM HIGH STATION!"));
+    Serial.print(F("Content: ")); Serial.println(backgroundMsg);
+    Serial.print(F("RSSI:    ")); Serial.print(radio.getRSSI()); Serial.println(F(" dBm"));
+    radio.startReceive();
+  }
+}
+
+/**
+ * Handles Serial inputs and Button events assigned to the Master profile.
+ */
+void runEspNowMaster() {
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    esp_now_send(slaveAddress, (uint8_t *)input.c_str(), input.length());
+  }
+
+  if (digitalRead(ESP_NOW_BUTTON) == LOW) {
+    delay(200);
+    String t = "timer";
+    esp_now_send(slaveAddress, (uint8_t *)t.c_str(), t.length());
+  }
+
+  // Manage LED dynamic timer expiration for the profile
+  if (ledTimer > 0 && millis() > ledTimer) {
+    digitalWrite(LED_PIN, HIGH); // LED OFF
+    ledTimer = 0;
+  }
+}
