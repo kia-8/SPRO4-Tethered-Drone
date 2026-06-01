@@ -1,0 +1,160 @@
+#include <Arduino.h>
+
+// PIN DEFINITIONS
+const int MOTOR_ENB = 4;      // PWM pin
+const int MOTOR_IN3 = 2;
+const int MOTOR_IN4 = 3;
+
+#define LED_PIN 8
+
+// TIMING VARIABLES
+unsigned long lastLoopTime = 0;
+unsigned long ledTimer = 0;
+
+// DRONE VARIABLES
+float currentAltitude = 0.0;
+float targetAltitude = 10.0;
+
+// PID PARAMETERS (FROM SIMULINK)
+float Kp = 1.0;
+float Ki = 0.2;
+float Kd = 0.1;
+float N  = 100.0;
+
+// PID STATES
+float integral = 0.0;
+float lastError = 0.0;
+float filterState = 0.0;
+
+// ESP-NOW STRUCT PLACEHOLDER
+struct esp_now_recv_info {
+    uint8_t src_addr[6];
+};
+
+// DATA RECEIVE CALLBACK
+void OnDataRecv(const esp_now_recv_info *info,
+                const uint8_t *data,
+                int len)
+{
+    char buf[len + 1];
+
+    memcpy(buf, data, len);
+    buf[len] = '\0';
+
+    String msg = String(buf);
+    msg.trim();
+
+    if (msg.startsWith("ALT:"))
+    {
+        String altValueStr = msg.substring(4);
+        currentAltitude = altValueStr.toFloat();
+        Serial.print("Drone Altitude Updated: ");
+        Serial.print(currentAltitude);
+        Serial.println(" m");
+    }
+    else if (msg == "timer")
+    {
+        digitalWrite(LED_PIN, LOW);
+        ledTimer = millis() + 2000;
+    }
+}
+
+// ==========================================
+// WINCH CONTROL LOOP
+// ==========================================
+void runWinchControlLoop()
+{
+    unsigned long currentTime = millis();
+    float dt = (currentTime - lastLoopTime) / 1000.0f;
+    lastLoopTime = currentTime;
+    if (dt <= 0.0f)
+        return;
+
+    // Error
+    float error = targetAltitude - currentAltitude;
+
+    // Integral (matches Simulink Forward Euler)
+    integral += error * dt;
+
+    // Filtered Derivative
+    // Matches Simulink derivative filter
+    float filterInput = (error - lastError) / dt;
+    float alpha = (N * dt) / (1.0f + N * dt);
+    filterState += alpha * (filterInput - filterState);
+    float derivative = filterState;
+    lastError = error;
+
+    // PID Output
+    float controlOutput =
+        (Kp * error) +
+        (Ki * integral) +
+        (Kd * derivative);
+
+    // Convert to PWM
+    int motorSpeed = abs((int)controlOutput);
+    motorSpeed = constrain(motorSpeed, 0, 255);
+
+    // Motor Control
+    if (controlOutput > 0.0f)
+    {
+        // Drone below target altitude
+        // Unwind rope
+        digitalWrite(MOTOR_IN3, HIGH);
+        digitalWrite(MOTOR_IN4, LOW);
+        ledcWrite(0, motorSpeed);
+    }
+    else if (controlOutput < -0.0f)
+    {
+        // Drone above target altitude
+        // Wind rope
+        digitalWrite(MOTOR_IN3, LOW);
+        digitalWrite(MOTOR_IN4, HIGH);
+        ledcWrite(0, motorSpeed);
+    }
+    else
+    {
+        ledcWrite(0, 0);
+    }
+
+    // Debug Output
+    Serial.print("Alt: ");
+    Serial.print(currentAltitude);
+    Serial.print(" Error: ");
+    Serial.print(error);
+    Serial.print(" PID: ");
+    Serial.print(controlOutput);
+    Serial.print(" PWM: ");
+    Serial.println(motorSpeed);
+}
+
+// SETUP
+void setup()
+{
+    Serial.begin(115200);
+    pinMode(MOTOR_IN3, OUTPUT);
+    pinMode(MOTOR_IN4, OUTPUT);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(LED_PIN, HIGH);
+
+    // ESP32 PWM Configuration
+    ledcSetup(0, 5000, 8);        // Channel 0, 5kHz, 8-bit
+    ledcAttachPin(MOTOR_ENB, 0);
+    lastLoopTime = millis();
+}
+
+// MAIN LOOP
+void loop()
+{
+    // LED timer handling
+    if (ledTimer > 0 && millis() >= ledTimer)
+    {
+        digitalWrite(LED_PIN, HIGH);
+        ledTimer = 0;
+    }
+
+    // 100 Hz loop (matches Simulink)
+    if (millis() - lastLoopTime >= 10)
+    {
+        runWinchControlLoop();
+    }
+}
