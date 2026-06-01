@@ -1,0 +1,219 @@
+// ==========================================
+// LIBRARIES & DEPENDENCIES
+// ==========================================
+#include <Arduino.h>
+#include <ESP32Servo.h>
+#include <Wire.h>
+#include <Adafruit_MMA8451.h>
+#include <Adafruit_Sensor.h>
+#include <RadioLib.h>
+#include <SPI.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+
+// ==========================================
+// PIN CONFIGURATIONS & HARDWARE SETUP
+// ==========================================
+// LoRa Pin Configuration
+#define LORA_CS    7
+#define LORA_RST   2
+#define LORA_DIO0  3 
+
+#define LED_PIN          8
+#define ESP_NOW_BUTTON   3  // Renamed from BUTTON_PIN to avoid duplication
+#define LORA_BUTTON      9  // Renamed from BUTTON_PIN to avoid duplication
+
+// ESP-NOW Target Network Addresses
+uint8_t masterAddress[] = {0xAC, 0xA7, 0x04, 0xB8, 0xF5, 0x98};
+uint8_t slaveAddress[]  = {0x58, 0x8C, 0x81, 0xA3, 0x3C, 0x2C};
+
+// Create Global Hardware Objects & Variables
+Adafruit_MMA8451 mma = Adafruit_MMA8451(); 
+SX1276 radio = new Module(LORA_CS, LORA_DIO0, LORA_RST);
+unsigned long ledTimer = 0;
+
+// ==========================================
+// CALLBACK FUNCTIONS
+// ==========================================
+
+// Added back missing OnDataSent callback required by esp_now_register_send_cb
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("Send Status: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
+}
+
+// Unified Receive Callback (handles incoming messages for both profiles)
+void OnDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           info->src_addr[0], info->src_addr[1], info->src_addr[2], 
+           info->src_addr[3], info->src_addr[4], info->src_addr[5]);
+
+  char buf[len + 1];
+  memcpy(buf, data, len);
+  buf[len] = '\0';
+  String msg = String(buf);
+  msg.trim();
+  
+  Serial.print("GOT DATA from ");
+  Serial.print(macStr);
+  Serial.print(": ");
+  Serial.println(msg);
+
+  if (msg == "timer") {
+    digitalWrite(LED_PIN, LOW); // LED ON
+    ledTimer = millis() + 2000;
+  }
+}
+
+// ==========================================
+// MAIN SETUP
+// ==========================================
+void setup() {
+  // Initialize serial communication first so messages print properly
+  Serial.begin(115200);
+  delay(2000);
+  
+  // Initialize I2C and Accelerometer
+  Wire.begin();
+  if (!mma.begin()) {
+    Serial.println("Could not start MMA8451 accelerometer! Check wiring.");
+    while (1); // Halt if sensor not found
+  }
+  mma.setRange(MMA8451_RANGE_2_G);
+  
+  // Hardware Pin Configuration
+  pinMode(ESP_NOW_BUTTON, INPUT_PULLUP);
+  pinMode(LORA_BUTTON, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH); // LED OFF
+  
+  // Initialize standard hardware SPI pins automatically mapped by the board
+  // SCK=4, MISO=5, MOSI=6, CS=7
+  SPI.begin(4, 5, 6, 7);
+
+  Serial.println(F("[HIGH-STATION] Initializing LoRa..."));
+  int state = radio.begin(433.0, 125.0, 12, 8);
+
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.println(F("✅ HIGH STATION ONLINE!"));
+    radio.setOutputPower(20); 
+    radio.startReceive();
+  } else {
+    Serial.print(F("❌ Init failed, code: ")); Serial.println(state);
+    while (true);
+  }
+
+  // Wi-Fi / ESP-NOW Hardware Layer Setup
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE); // Force radio channel 1
+  WiFi.setSleep(false);                           // Prevent radio power-saving
+
+  if (esp_now_init() != ESP_OK) return;
+
+  // Register Callback Subscriptions
+  esp_now_register_send_cb(esp_now_send_cb_t(OnDataSent));
+  esp_now_register_recv_cb(esp_now_recv_cb_t(OnDataRecv));
+
+  // Register Slave Peer
+  esp_now_peer_info_t slavePeer = {};
+  memcpy(slavePeer.peer_addr, slaveAddress, 6);
+  slavePeer.channel = 1;
+  slavePeer.encrypt = false;
+  if (esp_now_add_peer(&slavePeer) != ESP_OK) {
+    Serial.println("Failed to add Slave peer");
+  }
+
+  // Register Master Peer
+  esp_now_peer_info_t masterPeer = {};
+  memcpy(masterPeer.peer_addr, masterAddress, 6);
+  masterPeer.channel = 1;
+  masterPeer.encrypt = false;
+  esp_now_add_peer(&masterPeer);
+  
+  Serial.println("Master/Slave Unified System Online...");
+}
+
+// ==========================================
+// MAIN LOOP
+// ==========================================
+void loop() {
+  readAccelerometer();  
+  runLoraHighStation();
+  runEspNowSlave();
+}
+
+// ==========================================
+// MODULAR FUNCTIONS
+// ==========================================
+
+/**
+ * Reads data from the MMA8451 accelerometer and prints it to Serial.
+ */
+void readAccelerometer() {
+  sensors_event_t event;
+
+  // Read accelerometer values
+  mma.getEvent(&event);
+
+  // Print X, Y, Z values
+  Serial.print("X: ");
+  Serial.print(event.acceleration.x);
+  Serial.print("  Y: ");
+  Serial.print(event.acceleration.y);
+  Serial.print("  Z: ");
+  Serial.println(event.acceleration.z);
+  delay(1000);
+} 
+
+/**
+ * Handles the LoRa background receiving and button-press transmissions for High Station.
+ */
+void runLoraHighStation() {
+  // Check for button press
+  if (digitalRead(LORA_BUTTON) == LOW) {
+    delay(50); // Debounce
+    if (digitalRead(LORA_BUTTON) == LOW) {
+      Serial.println(F("\n[BUTTON] High Station sending manual alert..."));
+      radio.transmit("ALERT_FROM_HIGH_STATION");
+      radio.startReceive(); // Re-open receiver immediately
+      
+      while(digitalRead(LORA_BUTTON) == LOW); // Wait for release
+    }
+  }
+
+  // Check for incoming data
+  String groundMessage;
+  int rxState = radio.readData(groundMessage);
+
+  if (rxState == RADIOLIB_ERR_NONE) {
+    Serial.println(F("\n📥 RECEIVED FROM GROUND!"));
+    Serial.print(F("Data: ")); Serial.println(groundMessage);
+    Serial.print(F("RSSI: ")); Serial.print(radio.getRSSI()); Serial.println(F(" dBm"));
+
+    if (groundMessage.startsWith("PING")) {
+      delay(200); 
+      Serial.println(F("Ux Sending automatic response..."));
+      radio.transmit("PONG_RECEIPT_OK");
+    }
+    radio.startReceive(); // Re-arm background listening
+  }
+}
+
+/**
+ * Handles transmissions initiated by the Slave device profile.
+ */
+void runEspNowSlave() {
+  if (digitalRead(ESP_NOW_BUTTON) == LOW) {
+    delay(200);
+    String t = "timer";
+    esp_now_send(masterAddress, (uint8_t *)t.c_str(), t.length());
+  }
+
+  // Manage LED dynamic timer expiration for both profiles
+  if (ledTimer > 0 && millis() > ledTimer) {
+    digitalWrite(LED_PIN, HIGH); // LED OFF
+    ledTimer = 0;
+  }
+}
